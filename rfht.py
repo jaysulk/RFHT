@@ -1,23 +1,33 @@
 """
-Regularized Fast Hartley Transform (RFHT) for Neural Operators
-==============================================================
-Inspired by Jones (2022), "The Regularized Fast Hartley Transform:
-Low-Complexity Parallel Computation of the FHT in One and Multiple Dimensions"
+Regularized Fast Hartley Transform (RFHT) for Neural Operators — CORRECTED
+==========================================================================
+Inspired by Jones (2022), "The Regularized Fast Hartley Transform."
 
-Key ideas from the book translated to PyTorch:
-1. Partitioned-memory butterfly structure (dibit-reversal ordering)
-2. 8-fold parallelism via the double butterfly processing element
-3. Structural weight factorization as a regularizer on spectral convolution
+CORRECTED DESIGN (v2):
+----------------------
+The previous version made a conceptual error: it replaced the *learned*
+spectral weights with a butterfly factorization. This crippled the diagonal
+operator that elliptic PDEs require (pointwise mult by 1/|k|^2), hurting
+exactly the Poisson/biharmonic case where HNO should dominate.
 
-The "regularization" in Jones' sense is algorithmic: the RFHT imposes a
-specific factorization of the transform computation that constrains how
-information flows between frequency bins. We exploit this as a structural
-prior on the learned spectral weight matrices in the HNO.
+This version separates the two distinct ideas in Jones' book:
 
-Architecture note:
-- Standard HNO (from paper): dense Weven, Wodd per quadrant — 8 dense matrices
-- RHNO (this work): weights factorized via butterfly stages — far fewer parameters,
-  structured sparsity that mirrors the RFHT compute graph
+  (A) RFHT as a FAST TRANSFORM
+      The butterfly with FIXED twiddle factors computes the DHT efficiently.
+      In PyTorch this is mathematically identical to the Re-Im FFT trick
+      (validated in the paper); the hardware speedup needs a custom kernel.
+      We provide both a reference fixed-butterfly FHT and the fast Re-Im path.
+
+  (B) Diagonal-capable LEARNED operator (preserves paper's elliptic win)
+      The learned spectral weights stay dense per-mode (exactly as HNO),
+      so the diagonal Green's-function multiplier remains representable.
+
+  (C) Optional structured CORRECTION as a regularizer (the new contribution)
+      A 2D butterfly-structured, cross-mode coupling term, GATED by a scalar
+      initialized to ZERO. At init, RHNO == HNO exactly. The correction can
+      only add structured coupling if it reduces loss. This is the honest
+      "regularization" story: structure is added on top of, not in place of,
+      the diagonal operator.
 """
 
 import torch
@@ -28,316 +38,244 @@ from typing import Tuple, Optional
 
 
 # ---------------------------------------------------------------------------
-# 1. DHT via FFT (same as original HNO paper, Re - Im trick)
+# 1. DHT (Re-Im FFT path) — fast, validated in paper
 # ---------------------------------------------------------------------------
 
 def dht2d(x: torch.Tensor) -> torch.Tensor:
-    """
-    2D Discrete Hartley Transform via FFT.
-    H{f}(k) = Re{F{f}(k)} - Im{F{f}(k)}
-    
-    Input:  (..., H, W) real tensor
-    Output: (..., H, W) real tensor
-    """
+    """2D DHT via FFT: H{f} = Re{F{f}} - Im{F{f}}."""
     X = torch.fft.fft2(x)
     return X.real - X.imag
 
 
 def idht2d(H: torch.Tensor) -> torch.Tensor:
-    """
-    Inverse 2D DHT. The DHT is self-inverse up to 1/N normalization.
-    Since torch.fft.ifft2 handles normalization, we use the same Re-Im trick.
-    """
+    """Inverse 2D DHT (self-inverse up to 1/N)."""
     N = H.shape[-1] * H.shape[-2]
     return dht2d(H) / N
 
 
 # ---------------------------------------------------------------------------
-# 2. Dibit-reversal permutation (from Jones Ch. 4)
-#
-# In the RFHT, data is reordered between memory partitions using dibit-reversal
-# (a generalization of bit-reversal for radix-4). For a neural operator, this
-# defines which frequency bins are "coupled" in each butterfly stage.
+# 2. Dibit-reversal permutation (Jones Ch. 4) — valid permutation for any n
 # ---------------------------------------------------------------------------
 
 def dibit_reverse_indices(n: int) -> torch.Tensor:
     """
-    Compute dibit-reversal permutation indices for length-n sequence.
-    n must be a power of 4 (or we fall back to bit-reversal for power of 2).
-    
-    Jones (2022) §4.3: the RFHT uses dibit-reversal rather than bit-reversal
-    to achieve 8-fold parallelism with the double butterfly PE.
+    Valid permutation for any n.
+    Dibit-reversal for power-of-4, bit-reversal for power-of-2, identity else.
+    (The reordering only has structural meaning for power-of-2/4 sizes.)
     """
     if n == 1:
-        return torch.tensor([0])
-    
-    # Check if power of 4
+        return torch.tensor([0], dtype=torch.long)
     log4 = math.log(n, 4)
     is_pow4 = abs(log4 - round(log4)) < 1e-9
-    
-    indices = list(range(n))
-    
+    log2 = math.log2(n)
+    is_pow2 = abs(log2 - round(log2)) < 1e-9
+
     if is_pow4:
-        # Dibit reversal: reverse 2-bit groups
         num_dibits = int(round(log4))
         result = []
         for i in range(n):
-            rev = 0
-            val = i
+            rev = 0; val = i
             for _ in range(num_dibits):
-                rev = (rev << 2) | (val & 0x3)
-                val >>= 2
+                rev = (rev << 2) | (val & 0x3); val >>= 2
             result.append(rev)
         return torch.tensor(result, dtype=torch.long)
-    else:
-        # Fallback: standard bit-reversal for power of 2
-        num_bits = int(math.log2(n))
+    elif is_pow2:
+        num_bits = int(round(log2))
         result = []
         for i in range(n):
             rev = int(bin(i)[2:].zfill(num_bits)[::-1], 2)
             result.append(rev)
         return torch.tensor(result, dtype=torch.long)
+    else:
+        return torch.arange(n, dtype=torch.long)
 
 
 # ---------------------------------------------------------------------------
-# 3. RFHT Butterfly Stage
+# 3. Fixed-twiddle FHT (reference for the RFHT "fast transform" path)
 #
-# Jones' double butterfly PE combines two radix-2 butterfly stages:
-#   [a, b, c, d] -> [a+b+c+d, a-b+c-d, a+b-c-d, a-b-c+d] (with twiddles)
-#
-# For the neural operator, we implement this as a learnable butterfly layer
-# where the twiddle factors are replaced by learned real weights.
-# This is the core "structural regularization" idea.
+# This computes the DHT using the radix-2 butterfly recurrence with FIXED
+# (non-learned) cas twiddle factors. It is mathematically identical to dht2d
+# but exposes the butterfly compute graph that maps to Jones' FPGA architecture.
+# Used as a reference / for the hardware-deployment story, NOT as a learned op.
 # ---------------------------------------------------------------------------
 
-class ButterflyStage(nn.Module):
+def fht1d_fixed(x: torch.Tensor) -> torch.Tensor:
     """
-    One stage of the regularized butterfly factorization.
-    
-    Each butterfly stage couples pairs of frequency bins with a 2x2 real
-    weight matrix (replacing fixed twiddle factors with learned weights).
-    
-    For a size-M frequency space, stage s couples bins that are 2^s apart.
-    The total number of learnable parameters per stage: M (not M^2 as in dense).
-    
-    This is the key regularization: O(M log M) parameters instead of O(M^2).
+    1D FHT along the last dimension using fixed cas twiddles.
+    Matches torch DHT (Re-Im) up to floating point. O(N log N) structure,
+    though implemented here with full matrices for clarity (reference only).
     """
-    def __init__(self, num_modes: int, in_channels: int, out_channels: int,
-                 stage: int):
+    N = x.shape[-1]
+    n = torch.arange(N, device=x.device, dtype=x.dtype)
+    k = n.view(-1, 1)
+    cas = torch.cos(2 * math.pi * k * n / N) + torch.sin(2 * math.pi * k * n / N)
+    return torch.einsum('...n,kn->...k', x, cas)
+
+
+# ---------------------------------------------------------------------------
+# 4. Optional 2D Butterfly Correction (the regularizer) — ZERO-INITIALIZED
+#
+# Adds structured cross-mode coupling on top of the diagonal operator.
+# Separable: a butterfly along height-modes and one along width-modes.
+# Gated by a learnable scalar `gamma` initialized to 0, so at init this is
+# a no-op and RHNO == HNO exactly.
+# ---------------------------------------------------------------------------
+
+class ButterflyCorrection2d(nn.Module):
+    """
+    Zero-initialized structured correction. Couples modes within a quadrant
+    via learned 2x2 butterfly blocks along each spatial-frequency axis.
+    """
+    def __init__(self, channels: int, modes: int, num_stages: Optional[int] = None):
         super().__init__()
-        self.num_modes = num_modes
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.stage = stage
-        
-        # Stride for this butterfly stage (Jones: stride = N/2^(s+1))
-        self.stride = max(1, num_modes // (2 ** (stage + 1)))
-        
-        # Learnable weights for butterfly: 2x2 real mixing per frequency pair
-        # Shape: (num_pairs, out_channels, in_channels, 2, 2)
-        # where 2x2 replaces the fixed [1,1;1,-1] Hadamard with learned values
-        num_pairs = num_modes // 2
-        self.W = nn.Parameter(
-            torch.randn(num_pairs, out_channels, in_channels, 2, 2)
-            * (1.0 / math.sqrt(in_channels * 2))
-        )
-        
+        self.channels = channels
+        self.modes = modes
+        if num_stages is None:
+            self.num_stages = max(1, int(math.log2(modes))) if modes > 1 else 1
+        else:
+            self.num_stages = num_stages
+
+        half = modes // 2
+        # Butterfly 2x2 blocks for height axis and width axis, per stage.
+        # Initialize near the identity butterfly [[1,1],[1,-1]]/sqrt(2) so the
+        # correction produces a MEANINGFUL signal h. The no-op property at init
+        # comes solely from gamma=0 (ReZero/LayerScale-style), which keeps the
+        # gradient dL/dgamma = <upstream, h> at a usable magnitude rather than
+        # vanishing (the bug from a tiny-weight init).
+        base = torch.tensor([[1.0, 1.0], [1.0, -1.0]]) / math.sqrt(2)
+        init_h = base.view(1, 1, 1, 2, 2).repeat(self.num_stages, half, channels, 1, 1)
+        init_w = init_h.clone()
+        init_h = init_h + 0.05 * torch.randn_like(init_h)
+        init_w = init_w + 0.05 * torch.randn_like(init_w)
+        self.bfly_h = nn.Parameter(init_h)
+        self.bfly_w = nn.Parameter(init_w)
+        # Zero-initialized gate — at init, correction contributes nothing,
+        # but its gradient is non-vanishing because h is meaningful.
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+        self.register_buffer('perm', dibit_reverse_indices(modes))
+
+    def _butterfly_axis(self, x: torch.Tensor, weights: torch.Tensor,
+                        axis: int) -> torch.Tensor:
+        """
+        Apply paired butterfly mixing along `axis` (either -2 or -1).
+        x: (B, C, m, m). weights: (num_stages, half, C, 2, 2).
+        """
+        h = x
+        m = self.modes
+        half = m // 2
+        for s in range(self.num_stages):
+            if axis == -1:
+                lo = h[..., :half]            # (B, C, m, half)
+                hi = h[..., half:]
+                pairs = torch.stack([lo, hi], dim=-1)        # (B,C,m,half,2)
+                # contract channel + pair-component with per-position 2x2
+                # weights[s]: (half, C, 2, 2)
+                out = torch.einsum('bcmhp,hcpq->bcmhq', pairs, weights[s])
+                h = torch.cat([out[..., 0], out[..., 1]], dim=-1)
+                h = h[..., self.perm]
+            else:  # axis == -2
+                lo = h[:, :, :half, :]        # (B, C, half, m)
+                hi = h[:, :, half:, :]
+                pairs = torch.stack([lo, hi], dim=-1)        # (B,C,half,m,2)
+                out = torch.einsum('bchmp,hcpq->bchmq', pairs, weights[s])
+                h = torch.cat([out[..., 0], out[..., 1]], dim=2)
+                h = h[:, :, self.perm, :]
+        return h
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (batch, in_channels, num_modes_h, num_modes_w)
-        Returns: (batch, out_channels, num_modes_h, num_modes_w)
-        
-        For 2D, we apply butterfly along the last dimension (width modes).
-        A full 2D butterfly would apply to both dims; this is a simplified
-        separable version consistent with the 2D RFHT.
-        """
-        B, C_in, H, W = x.shape
-        M = W  # num_modes along width
-        
-        # Reshape to (batch, channels, num_pairs, 2)
-        # pairing bins [k, k + stride] for each k in [0, stride)
-        stride = self.stride
-        
-        # Simple paired butterfly: pair k with k + M//2
-        half = M // 2
-        x_low = x[..., :half]   # (B, C_in, H, half)
-        x_high = x[..., half:]  # (B, C_in, H, half)
-        
-        # Stack pairs: (B, C_in, H, half, 2)
-        pairs = torch.stack([x_low, x_high], dim=-1)
-        
-        # Apply learned 2x2 mixing per pair position
-        # W: (half, C_out, C_in, 2, 2)
-        # We use einsum: bihkp, kopi -> bohk  (then reassemble)
-        # Simplified: apply same W across H spatial dim
-        
-        # pairs: (B, C_in, H, half, 2)
-        # Contract over C_in and the 2 pair components
-        # W[k]: (C_out, C_in, 2, 2) for each pair k
-        
-        # Vectorize over pairs using einsum
-        # pairs -> (B, H, half, C_in, 2)
-        pairs_t = pairs.permute(0, 2, 3, 1, 4)  # (B, H, half, C_in, 2)
-        
-        # W: (half, C_out, C_in, 2, 2)
-        # output[b,h,k,o,q] = sum_{i,p} pairs[b,h,k,i,p] * W[k,o,i,p,q]
-        out_pairs = torch.einsum('bhkip,koipq->bhkoq', pairs_t, self.W)
-        # out_pairs: (B, H, half, C_out, 2)
-        
-        out_pairs = out_pairs.permute(0, 3, 1, 2, 4)  # (B, C_out, H, half, 2)
-        
-        # Reassemble
-        out = torch.cat([out_pairs[..., 0], out_pairs[..., 1]], dim=-1)
-        # out: (B, C_out, H, M)
-        
-        return out
+        """x: (B, C, modes, modes). Returns same shape, gated by gamma."""
+        h = self._butterfly_axis(x, self.bfly_w, axis=-1)
+        h = self._butterfly_axis(h, self.bfly_h, axis=-2)
+        return self.gamma * h
 
 
 # ---------------------------------------------------------------------------
-# 4. RFHT Spectral Convolution Layer (core RHNO building block)
+# 5. Corrected RFHT Spectral Convolution
 #
-# Replaces the dense Weven/Wodd quadrant weights of HNO with a
-# butterfly-factorized weight structure inspired by the RFHT.
-#
-# Standard HNO spectral conv (from paper):
-#   - 8 dense weight matrices (4 quadrants × 2 even/odd)
-#   - Parameters: 8 × kmax^2 × C^2
-#
-# RFHT-regularized spectral conv (this work):
-#   - log2(kmax) butterfly stages per quadrant pair
-#   - Parameters: 4 × log2(kmax) × kmax × C^2 / 2
-#   - Structural sparsity = regularization
+# Main path: diagonal-capable dense per-mode weights (IDENTICAL to HNO),
+#            preserving the elliptic Green's-function advantage.
+# Optional:  zero-init butterfly correction adding structured coupling.
 # ---------------------------------------------------------------------------
 
 class RFHTSpectralConv2d(nn.Module):
     """
-    RFHT-regularized Hartley spectral convolution for 2D problems.
-    
-    The weight structure is factorized via butterfly stages, mirroring
-    Jones' RFHT partitioned-memory architecture. This imposes a structural
-    prior on how learned weights can couple frequency bins.
-    
-    Key difference from HNO paper:
-    - HNO: dense Weven, Wodd per quadrant (8 dense matrices)
-    - RHNO: butterfly-factorized weights per quadrant (log-depth circuit)
-    
-    The factorization is:
-        W_eff = W_stage_L @ ... @ W_stage_1 @ W_stage_0
-    where each stage is a sparse butterfly matrix.
+    Corrected Hartley spectral convolution.
+
+    Parameters
+    ----------
+    in_channels, out_channels : int
+    modes : int
+        Modes retained per quadrant edge.
+    use_butterfly_correction : bool
+        If False, this is EXACTLY the HNO dense spectral conv.
+        If True, adds a zero-initialized structured correction (RHNO).
+    num_butterfly_stages : int, optional
+        Depth of the correction's butterfly (default log2(modes)).
     """
-    
     def __init__(self, in_channels: int, out_channels: int, modes: int,
+                 use_butterfly_correction: bool = True,
                  num_butterfly_stages: Optional[int] = None):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.modes = modes  # kmax: number of modes retained per quadrant edge
-        
-        # Number of butterfly stages (depth of factorization)
-        # Jones' RFHT: log2(N) stages for radix-2, log4(N) for radix-4
-        # We use log2(modes) stages
-        if num_butterfly_stages is None:
-            self.num_stages = max(1, int(math.log2(modes))) if modes > 1 else 1
-        else:
-            self.num_stages = num_butterfly_stages
-        
-        # Four quadrant processors (matching HNO's four-corner structure)
-        # Each quadrant gets its own butterfly stack
-        # Quadrants: (low_h, low_w), (low_h, high_w),
-        #            (high_h, low_w), (high_h, high_w)
-        self.quad_butterflies = nn.ModuleList([
-            nn.ModuleList([
-                ButterflyStage(modes, in_channels, out_channels, stage=s)
-                for s in range(self.num_stages)
-            ])
-            for _ in range(4)  # 4 quadrants
+        self.modes = modes
+        self.use_correction = use_butterfly_correction
+
+        # Diagonal-capable dense per-mode weights (4 quadrants x even/odd).
+        # einsum keeps modes (kh,kw) independent -> can represent any diagonal.
+        scale = 1.0 / (in_channels * out_channels)
+        self.W_even = nn.ParameterList([
+            nn.Parameter(scale * torch.randn(out_channels, in_channels, modes, modes))
+            for _ in range(4)
         ])
-        
-        # Separate even/odd mixing per quadrant (from HNO convolution theorem)
-        # These are lightweight 1x1 channel mixers applied after butterfly
-        self.even_mix = nn.Parameter(
-            torch.randn(4, out_channels, out_channels) * 0.02
-        )
-        self.odd_mix = nn.Parameter(
-            torch.randn(4, out_channels, out_channels) * 0.02
-        )
-        
-        # Dibit-reversal permutation indices (precomputed)
-        self.register_buffer(
-            'perm', dibit_reverse_indices(modes)
-        )
-        
-    def _apply_quadrant_butterfly(self, x_quad: torch.Tensor,
-                                   quad_idx: int) -> torch.Tensor:
-        """
-        Apply butterfly stack to one frequency quadrant.
-        x_quad: (batch, in_channels, modes, modes)
-        """
-        h = x_quad
-        for stage in self.quad_butterflies[quad_idx]:
-            h = stage(h)
-            # Apply dibit-reversal permutation between stages
-            # (Jones: data reordering between partitioned memories)
-            if h.shape[-1] == self.modes:
-                h = h[..., self.perm]
-        return h
-    
+        self.W_odd = nn.ParameterList([
+            nn.Parameter(scale * torch.randn(out_channels, in_channels, modes, modes))
+            for _ in range(4)
+        ])
+
+        # Optional structured correction (operates in out_channel space)
+        if use_butterfly_correction:
+            self.correction = nn.ModuleList([
+                ButterflyCorrection2d(out_channels, modes, num_butterfly_stages)
+                for _ in range(4)
+            ])
+        else:
+            self.correction = None
+
+    def _diag_mul(self, W, x):
+        # (out,in,kh,kw),(B,in,kh,kw) -> (B,out,kh,kw): per-mode channel mix
+        return torch.einsum('oikj,bikj->bokj', W, x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (batch, in_channels, H, W) — spatial domain input
-        Returns: (batch, out_channels, H, W)
-        """
         B, C, H, W = x.shape
         m = self.modes
-        
-        # Step 1: DHT
-        x_ht = dht2d(x)  # (B, C, H, W), real
-        
-        # Step 2: Even/odd decomposition (from HNO paper Eq. 9)
-        # H_even[k] = (H[k] + H[-k]) / 2
-        # H_odd[k]  = (H[k] - H[-k]) / 2
-        x_flip = torch.roll(torch.flip(x_ht, dims=[-1, -2]), shifts=(1, 1),
-                            dims=[-1, -2])
+
+        x_ht = dht2d(x)
+        x_flip = torch.roll(torch.flip(x_ht, dims=[-1, -2]),
+                            shifts=(1, 1), dims=[-1, -2])
         x_even = (x_ht + x_flip) / 2.0
         x_odd  = (x_ht - x_flip) / 2.0
-        
-        # Step 3: Extract four frequency quadrants (matching HNO four-corner)
-        quads_even = [
-            x_even[:, :, :m, :m],        # top-left
-            x_even[:, :, :m, -m:],       # top-right
-            x_even[:, :, -m:, :m],       # bottom-left
-            x_even[:, :, -m:, -m:],      # bottom-right
+
+        slots = [
+            (slice(None, m),  slice(None, m)),
+            (slice(None, m),  slice(-m, None)),
+            (slice(-m, None), slice(None, m)),
+            (slice(-m, None), slice(-m, None)),
         ]
-        quads_odd = [
-            x_odd[:, :, :m, :m],
-            x_odd[:, :, :m, -m:],
-            x_odd[:, :, -m:, :m],
-            x_odd[:, :, -m:, -m:],
-        ]
-        
-        # Step 4: Apply RFHT butterfly factorization per quadrant
-        out_quads = []
-        for q in range(4):
-            # Process even and odd components through butterfly
-            h_even = self._apply_quadrant_butterfly(quads_even[q], q)
-            h_odd  = self._apply_quadrant_butterfly(quads_odd[q], q)
-            
-            # Mix even/odd (replaces Weven·Heven + Wodd·Hodd from HNO paper)
-            # Using learned 1x1 channel mixing
-            # h_even: (B, out_channels, m, m) already after butterfly
-            # Apply even_mix[q]: (out_channels, out_channels)
-            h_e = torch.einsum('oi,biHW->boHW', self.even_mix[q], h_even)
-            h_o = torch.einsum('oi,biHW->boHW', self.odd_mix[q], h_odd)
-            
-            out_quads.append(h_e + h_o)
-        
-        # Step 5: Scatter back to full frequency grid
+        quads_e = [x_even[:, :, sh, sw] for sh, sw in slots]
+        quads_o = [x_odd[:, :, sh, sw]  for sh, sw in slots]
+
         out_ht = torch.zeros(B, self.out_channels, H, W,
                              device=x.device, dtype=x.dtype)
-        out_ht[:, :, :m, :m]   = out_quads[0]
-        out_ht[:, :, :m, -m:]  = out_quads[1]
-        out_ht[:, :, -m:, :m]  = out_quads[2]
-        out_ht[:, :, -m:, -m:] = out_quads[3]
-        
-        # Step 6: Inverse DHT back to spatial domain
+
+        for q, (sh, sw) in enumerate(slots):
+            # Diagonal-capable main operator (preserves elliptic advantage)
+            out = (self._diag_mul(self.W_even[q], quads_e[q]) +
+                   self._diag_mul(self.W_odd[q],  quads_o[q]))
+            # Optional zero-init structured correction
+            if self.correction is not None:
+                out = out + self.correction[q](out)
+            out_ht[:, :, sh, sw] = out
+
         return idht2d(out_ht)
