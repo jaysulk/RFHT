@@ -193,7 +193,8 @@ class NeuralOperator2d(nn.Module):
         x = self.fc0(x)
         x = rearrange(x, "b h w c -> b c h w")
         for k in range(self.nlayers):
-            x = F.gelu(self.spectral[k](x) + self.w[k](x))
+            z = self.spectral[k](x) + self.w[k](x)
+            x = F.gelu(z) if k < self.nlayers - 1 else z   # last block linear (Li/HNO convention)
         x = rearrange(x, "b c h w -> b h w c")
         x = self.fc2(F.gelu(self.fc1(x)))
         return x[..., 0]
