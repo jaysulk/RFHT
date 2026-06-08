@@ -114,9 +114,12 @@ class HartleyConv2d(nn.Module):
         super().__init__()
         self.in_ch, self.out_ch = in_ch, out_ch
         self.modes1, self.modes2 = modes1, modes2
-        scale = 1.0 / (in_ch * out_ch)
-        self.w_even = nn.Parameter(scale * torch.rand(4, in_ch, out_ch, modes1, modes2))
-        self.w_odd = nn.Parameter(scale * torch.rand(4, in_ch, out_ch, modes1, modes2))
+        # HNO init matches the validated pipeline: 1/(in+out) scale, zero-mean
+        # randn. NOT FNO's 1/(in*out) uniform -- that is ~16x too small and
+        # biased-positive, which starves HNO's spectral path at init.
+        scale = 1.0 / (in_ch + out_ch)
+        self.w_even = nn.Parameter(scale * torch.randn(4, in_ch, out_ch, modes1, modes2))
+        self.w_odd = nn.Parameter(scale * torch.randn(4, in_ch, out_ch, modes1, modes2))
 
     def _corners(self, H, W):
         m1, m2 = self.modes1, self.modes2
