@@ -22,9 +22,15 @@ import os, json, argparse
 import numpy as np
 import torch
 
-import monarch_operators                       # patches make_operator -> "monarch"
-from spectral_operators import (count_params, match_width, make_operator,
-                                 TrainConfig, train_eval, DEVICE)
+import monarch_operators                       # defines the monarch-aware make_operator
+import spectral_operators as _so
+# Force the global patch so train_eval / match_width (which resolve make_operator at
+# call time inside spectral_operators) build "monarch", regardless of import order:
+_so.make_operator = monarch_operators.make_operator
+# ...and use the monarch-aware dispatcher for any DIRECT calls in this module
+# (a plain `from spectral_operators import make_operator` would copy the stale original):
+make_operator = monarch_operators.make_operator
+from spectral_operators import count_params, match_width, TrainConfig, train_eval, DEVICE
 from darcy import make_darcy
 
 
