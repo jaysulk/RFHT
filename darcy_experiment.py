@@ -1,18 +1,21 @@
 """
-darcy_experiment.py -- does a learnable/Monarch transform beat fixed bases
-on a NON-diagonal operator, and does depth wash it out?
+darcy_experiment.py -- SELF-CONTAINED. Does a learnable/Monarch transform beat
+fixed bases on a NON-diagonal operator (Darcy), and does depth wash it out?
 =====================================================================
-Runs FNO / HNO / learnable-HNO / Monarch on Darcy flow across network
-depth, parameter-matched and seed-averaged under the identical shared
-recipe (align_lambda = 0). Darcy's solution operator is non-diagonal, so
-unlike Poisson/heat/wave there is a real representational floor for the
-learnable transforms to close (see b_sanity.py). The open question is
-whether the advantage survives once the network has depth to compensate.
+This file defines the Monarch layer inline and patches make_operator itself,
+so it depends only on your spectral_operators.py + darcy.py (no monarch_operators
+import -> nothing to go stale in a Colab session).
 
-Read the output:
-  edge = relL2(learnable) - min(relL2(FNO), relL2(HNO))   per depth
-    edge < 0  at usable depth  => learnable/Monarch genuinely wins (B alive)
-    edge -> 0 as depth grows   => depth compensates; basis advantage washes out
+Runs FNO / HNO / learnable-HNO / Monarch on Darcy flow across network depth,
+parameter-matched and seed-averaged under the identical shared recipe
+(align_lambda = 0). Darcy's solution operator is non-diagonal, so unlike
+Poisson/heat/wave there is a real representational floor for the learnable
+transforms to close (see b_sanity.py). Open question: does the advantage
+survive depth, which lets the network compensate?
+
+Read the output: edge = relL2(learnable) - min(relL2(FNO), relL2(HNO)) per depth.
+  edge < 0 at usable depth  => learnable/Monarch genuinely wins (B alive)
+  edge -> 0 as depth grows   => depth compensates; basis advantage washes out
 
   python darcy_experiment.py            # full: depths 1-4, 3 seeds
   python darcy_experiment.py --smoke    # tiny CPU check
@@ -21,19 +24,69 @@ Read the output:
 import os, json, argparse
 import numpy as np
 import torch
+import torch.nn as nn
 
-import monarch_operators                       # defines the monarch-aware make_operator
 import spectral_operators as _so
-# Force the global patch so train_eval / match_width (which resolve make_operator at
-# call time inside spectral_operators) build "monarch", regardless of import order:
-_so.make_operator = monarch_operators.make_operator
-# ...and use the monarch-aware dispatcher for any DIRECT calls in this module
-# (a plain `from spectral_operators import make_operator` would copy the stale original):
-make_operator = monarch_operators.make_operator
-from spectral_operators import count_params, match_width, TrainConfig, train_eval, DEVICE
+from spectral_operators import (HartleyConv2d, NeuralOperator2d, count_params,
+                                 match_width, TrainConfig, train_eval, DEVICE)
 from darcy import make_darcy
 
 
+# --------------------------------------------------------------------------- #
+#  Order-2 Monarch spectral layer (inline; starts at Hartley, non-separable)
+# --------------------------------------------------------------------------- #
+class MonarchHartleyConv2d(HartleyConv2d):
+    """HNO + learnable order-2 Monarch transform on the retained m x m block.
+    B1, B2 are (m, m, m) block tensors (a distinct m x m matrix per row),
+    initialized to identity so the layer starts exactly at Hartley but can
+    represent non-separable transforms (DFT/DHT and beyond)."""
+
+    def __init__(self, in_ch, out_ch, modes1, modes2, share_across_corners=True):
+        super().__init__(in_ch, out_ch, modes1, modes2)
+        assert modes1 == modes2, "Monarch layer uses a square m x m mode block"
+        m = modes1
+        self.m = m
+        eye_blocks = torch.eye(m).unsqueeze(0).repeat(m, 1, 1).clone()
+        self.B1 = nn.Parameter(eye_blocks.clone())
+        self.B2 = nn.Parameter(eye_blocks.clone())
+
+    def _monarch(self, X):                                   # X: (B, C, m, m)
+        Y = torch.einsum("piq,bcpq->bcpi", self.B1, X)       # block-diag along rows
+        Y = Y.transpose(-1, -2)                              # permutation
+        Z = torch.einsum("ikp,bcip->bcik", self.B2, Y)       # block-diag along new rows
+        return Z.transpose(-1, -2)
+
+    def _mix(self, e, o, i):
+        return self._monarch(e), self._monarch(o)
+
+    def alignment_penalty(self):
+        I = torch.eye(self.m, device=self.B1.device).unsqueeze(0)
+        return ((self.B1 - I) ** 2).sum() + ((self.B2 - I) ** 2).sum()
+
+    @torch.no_grad()
+    def basis_deviation(self):
+        I = torch.eye(self.m, device=self.B1.device).unsqueeze(0)
+        num = (torch.linalg.matrix_norm(self.B1 - I).mean()
+               + torch.linalg.matrix_norm(self.B2 - I).mean())
+        return float(num / (2.0 * np.sqrt(self.m)))
+
+
+# --- monarch-aware make_operator; patches the global so train_eval/match_width see it ---
+_ORIG_MAKE = getattr(_so, "_orig_make_operator", _so.make_operator)
+_so._orig_make_operator = _ORIG_MAKE          # stash once (idempotent across re-runs)
+
+
+def make_operator(kind, in_channels=3, width=32, nlayers=4, modes=12):
+    if str(kind).lower() in ("monarch", "monarch_hno", "monarch_ours"):
+        fac = lambda w: MonarchHartleyConv2d(w, w, modes, modes)
+        return NeuralOperator2d(fac, in_channels=in_channels, width=width, nlayers=nlayers)
+    return _ORIG_MAKE(kind, in_channels, width, nlayers, modes)
+
+
+_so.make_operator = make_operator             # train_eval / match_width resolve this at call time
+
+
+# --------------------------------------------------------------------------- #
 def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch"),
               depths=(1, 2, 3, 4), n_train=512, n_test=128, s=128, modes=12,
               epochs=200, seeds=(0, 1, 2), fno_width=32, kind="threshold",
@@ -73,12 +126,10 @@ def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch"),
         recs.append(rec)
         json.dump(rec, open(os.path.join(save_dir, f"darcy_depth{depth}.json"), "w"), indent=2)
 
-    # ---- summary ----
     print("\n" + "=" * 92)
     print(f"DARCY ({kind})   relL2 mean+/-std per operator; edge = learnable - best fixed")
     print("=" * 92)
-    hdr = f"{'depth':>6}" + "".join(f"{op:>16}" for op in operators)
-    print(hdr)
+    print(f"{'depth':>6}" + "".join(f"{op:>16}" for op in operators))
     for rec in recs:
         line = f"{rec['depth']:>6}"
         for op in operators:
@@ -98,9 +149,9 @@ def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch"),
         if op in recs[0]:
             edges = [r[op]["edge"] for r in recs]
             depths_ = [r["depth"] for r in recs]
-            c = np.corrcoef(depths_, edges)[0, 1] if len(edges) > 1 else float("nan")
+            c = float(np.corrcoef(depths_, edges)[0, 1]) if len(edges) > 1 else float("nan")
             best = min(edges)
-            tag = ("WINS at some depth" if best < -0.005 else "never beats fixed")
+            tag = "WINS at some depth" if best < -0.005 else "never beats fixed"
             trend = ("edge grows toward 0 with depth (compensation)" if c > 0
                      else "edge does not vanish with depth")
             print(f"    {op:>14}: {tag}; best edge {best:+.4f}; {trend} (corr depth,edge={c:+.2f})")
