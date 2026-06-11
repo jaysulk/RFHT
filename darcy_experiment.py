@@ -113,6 +113,38 @@ class LearnableFourierConv2d(SpectralConv2d):
         return float(num / (self.modes1 ** 0.5 + self.modes2 ** 0.5))
 
 
+
+class RegSpectralConv2d(nn.Module):
+    """Regularized real spectral conv: rfft transform (same as FNO) but REAL
+    per-mode weights -> half params / half spectral FLOPs. Included here to
+    test the BOUNDARY: it should LOSE to FNO off the aligned operators."""
+
+    def __init__(self, in_ch, out_ch, modes1, modes2):
+        super().__init__()
+        self.in_ch, self.out_ch = in_ch, out_ch
+        self.modes1, self.modes2 = modes1, modes2
+        scale = 1.0 / (in_ch + out_ch)
+        self.w1 = nn.Parameter(scale * torch.randn(in_ch, out_ch, modes1, modes2))
+        self.w2 = nn.Parameter(scale * torch.randn(in_ch, out_ch, modes1, modes2))
+
+    @staticmethod
+    def _rmul(xc, w):
+        return torch.complex(torch.einsum("bixy,ioxy->boxy", xc.real, w),
+                             torch.einsum("bixy,ioxy->boxy", xc.imag, w))
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        xft = torch.fft.rfft2(x)
+        out = torch.zeros(B, self.out_ch, H, W // 2 + 1, dtype=torch.cfloat, device=x.device)
+        m1, m2 = self.modes1, self.modes2
+        out[:, :, :m1, :m2] = self._rmul(xft[:, :, :m1, :m2], self.w1)
+        out[:, :, -m1:, :m2] = self._rmul(xft[:, :, -m1:, :m2], self.w2)
+        return torch.fft.irfft2(out, s=(H, W))
+
+    def alignment_penalty(self):
+        return torch.zeros((), device=self.w1.device)
+
+
 # --- monarch-aware make_operator; patches the global so train_eval/match_width see it ---
 _ORIG_MAKE = getattr(_so, "_orig_make_operator", _so.make_operator)
 _so._orig_make_operator = _ORIG_MAKE          # stash once (idempotent across re-runs)
@@ -124,6 +156,9 @@ def make_operator(kind, in_channels=3, width=32, nlayers=4, modes=12):
         return NeuralOperator2d(fac, in_channels=in_channels, width=width, nlayers=nlayers)
     if str(kind).lower() in ("learnable_fno", "lfno", "learnable_fourier"):
         fac = lambda w: LearnableFourierConv2d(w, w, modes, modes)
+        return NeuralOperator2d(fac, in_channels=in_channels, width=width, nlayers=nlayers)
+    if str(kind).lower() in ("reghno", "reg", "real_fno"):
+        fac = lambda w: RegSpectralConv2d(w, w, modes, modes)
         return NeuralOperator2d(fac, in_channels=in_channels, width=width, nlayers=nlayers)
     return _ORIG_MAKE(kind, in_channels, width, nlayers, modes)
 
