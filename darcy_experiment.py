@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 import spectral_operators as _so
-from spectral_operators import (HartleyConv2d, NeuralOperator2d, count_params,
+from spectral_operators import (HartleyConv2d, SpectralConv2d, NeuralOperator2d, count_params,
                                  match_width, TrainConfig, train_eval, DEVICE)
 from darcy import make_darcy
 
@@ -71,6 +71,48 @@ class MonarchHartleyConv2d(HartleyConv2d):
         return float(num / (2.0 * np.sqrt(self.m)))
 
 
+
+class LearnableFourierConv2d(SpectralConv2d):
+    """FNO + learnable complex separable mode-mixing, initialized at identity.
+    Starts EXACTLY at FNO (the best fixed basis on Darcy) -> tests whether
+    learning can improve even the strongest fixed basis."""
+
+    def __init__(self, in_ch, out_ch, m1, m2):
+        super().__init__(in_ch, out_ch, m1, m2)
+        self.L1 = nn.Parameter(torch.stack([torch.eye(m1), torch.zeros(m1, m1)], dim=-1))
+        self.L2 = nn.Parameter(torch.stack([torch.eye(m2), torch.zeros(m2, m2)], dim=-1))
+
+    def _mixL(self, blk):                                   # blk: (B,C,m1,m2) complex
+        L1 = torch.view_as_complex(self.L1.contiguous())
+        L2 = torch.view_as_complex(self.L2.contiguous())
+        blk = torch.einsum("mn,bcnj->bcmj", L1, blk)
+        return torch.einsum("bcmj,jk->bcmk", blk, L2)
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        xft = torch.fft.rfft2(x)
+        out = torch.zeros(B, self.out_ch, H, W // 2 + 1, dtype=torch.cfloat, device=x.device)
+        w1, w2 = torch.view_as_complex(self.w1), torch.view_as_complex(self.w2)
+        m1, m2 = self.modes1, self.modes2
+        out[:, :, :m1, :m2] = self._cmul(self._mixL(xft[:, :, :m1, :m2]), w1)
+        out[:, :, -m1:, :m2] = self._cmul(self._mixL(xft[:, :, -m1:, :m2]), w2)
+        return torch.fft.irfft2(out, s=(H, W))
+
+    def alignment_penalty(self):
+        L1 = torch.view_as_complex(self.L1.contiguous()); L2 = torch.view_as_complex(self.L2.contiguous())
+        I1 = torch.eye(self.modes1, device=L1.device, dtype=L1.dtype)
+        I2 = torch.eye(self.modes2, device=L2.device, dtype=L2.dtype)
+        return (L1 - I1).abs().pow(2).sum() + (L2 - I2).abs().pow(2).sum()
+
+    @torch.no_grad()
+    def basis_deviation(self):
+        L1 = torch.view_as_complex(self.L1.contiguous()); L2 = torch.view_as_complex(self.L2.contiguous())
+        I1 = torch.eye(self.modes1, device=L1.device, dtype=L1.dtype)
+        I2 = torch.eye(self.modes2, device=L2.device, dtype=L2.dtype)
+        num = (L1 - I1).abs().pow(2).sum().sqrt() + (L2 - I2).abs().pow(2).sum().sqrt()
+        return float(num / (self.modes1 ** 0.5 + self.modes2 ** 0.5))
+
+
 # --- monarch-aware make_operator; patches the global so train_eval/match_width see it ---
 _ORIG_MAKE = getattr(_so, "_orig_make_operator", _so.make_operator)
 _so._orig_make_operator = _ORIG_MAKE          # stash once (idempotent across re-runs)
@@ -80,6 +122,9 @@ def make_operator(kind, in_channels=3, width=32, nlayers=4, modes=12):
     if str(kind).lower() in ("monarch", "monarch_hno", "monarch_ours"):
         fac = lambda w: MonarchHartleyConv2d(w, w, modes, modes)
         return NeuralOperator2d(fac, in_channels=in_channels, width=width, nlayers=nlayers)
+    if str(kind).lower() in ("learnable_fno", "lfno", "learnable_fourier"):
+        fac = lambda w: LearnableFourierConv2d(w, w, modes, modes)
+        return NeuralOperator2d(fac, in_channels=in_channels, width=width, nlayers=nlayers)
     return _ORIG_MAKE(kind, in_channels, width, nlayers, modes)
 
 
@@ -87,7 +132,7 @@ _so.make_operator = make_operator             # train_eval / match_width resolve
 
 
 # --------------------------------------------------------------------------- #
-def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch"),
+def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch", "learnable_fno"),
               depths=(1, 2, 3, 4), n_train=512, n_test=128, s=128, modes=12,
               epochs=200, seeds=(0, 1, 2), fno_width=32, kind="threshold",
               save_dir="./darcy_results"):
@@ -120,7 +165,7 @@ def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch"),
                            params=count_params(make_operator(op, 3, w, depth, modes)))
         fixed = min(row["fno"]["best"], row.get("hno", row["fno"])["best"])
         for op in operators:
-            if op in ("learnable_hno", "monarch"):
+            if op in ("learnable_hno", "monarch", "learnable_fno"):
                 row[op]["edge"] = row[op]["best"] - fixed
         rec = dict(depth=depth, **{op: row[op] for op in operators})
         recs.append(rec)
@@ -138,22 +183,22 @@ def run_darcy(operators=("fno", "hno", "learnable_hno", "monarch"),
     print("\n  deltas (basis movement) and edges over best fixed basis:")
     for rec in recs:
         parts = [f"d={rec['depth']}"]
-        for op in ("learnable_hno", "monarch"):
+        for op in ("learnable_hno", "monarch", "learnable_fno"):
             if op in rec:
                 parts.append(f"{op}: delta={rec[op]['delta']:.3f} edge={rec[op]['edge']:+.4f}"
                              f"{' WIN' if rec[op]['edge'] < -0.005 else ''}")
         print("   " + " | ".join(parts))
 
     print("\n  verdict:")
-    for op in ("learnable_hno", "monarch"):
+    for op in ("learnable_hno", "monarch", "learnable_fno"):
         if op in recs[0]:
             edges = [r[op]["edge"] for r in recs]
             depths_ = [r["depth"] for r in recs]
             c = float(np.corrcoef(depths_, edges)[0, 1]) if len(edges) > 1 else float("nan")
             best = min(edges)
             tag = "WINS at some depth" if best < -0.005 else "never beats fixed"
-            trend = ("edge grows toward 0 with depth (compensation)" if c > 0
-                     else "edge does not vanish with depth")
+            trend = ("falls further behind fixed as depth grows" if c > 0
+                     else "gap to fixed shrinks with depth (compensation)")
             print(f"    {op:>14}: {tag}; best edge {best:+.4f}; {trend} (corr depth,edge={c:+.2f})")
     print("=" * 92)
     return recs
